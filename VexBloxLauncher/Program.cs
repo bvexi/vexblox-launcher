@@ -19,6 +19,7 @@ namespace VexBloxLauncher
         private const string ProtocolName = "vexblox";
         private const string LegacyProtocolName = "bbclient";
         private const string DefaultBaseUrl = "http://vexblx.fun";
+        private const string LauncherReleaseUrl = "https://github.com/bvexi/vexblox-launcher/releases/latest/download";
 
         private static readonly Dictionary<string, string> Clients = new Dictionary<string, string>
         {
@@ -94,17 +95,17 @@ namespace VexBloxLauncher
             string remote;
             try
             {
-                remote = (await Http.GetStringAsync($"{BaseUrl}/downloads/VexBloxLauncher.sha256.txt?t={DateTime.UtcNow.Ticks}")).Trim().ToLowerInvariant();
+                remote = (await Http.GetStringAsync($"{LauncherReleaseUrl}/VexBloxLauncher.sha256.txt")).Trim().ToLowerInvariant();
             }
             catch (Exception)
             {
                 return false;
             }
-            if (remote.Length != 64 || Sha256(current) == remote)
+            if (!IsSha256(remote) || Sha256(current) == remote)
                 return false;
 
             var downloaded = current + ".new";
-            await Download($"{BaseUrl}/downloads/VexBloxLauncher.exe?sha={remote}", downloaded, form);
+            await Download($"{LauncherReleaseUrl}/VexBloxLauncher.exe", downloaded, form);
             if (Sha256(downloaded) != remote)
             {
                 File.Delete(downloaded);
@@ -120,6 +121,11 @@ namespace VexBloxLauncher
                 UseShellExecute = false,
             });
             return true;
+        }
+
+        private static bool IsSha256(string value)
+        {
+            return value.Length == 64 && value.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
         }
 
         private static string Sha256(string path)
@@ -143,15 +149,10 @@ namespace VexBloxLauncher
             }
 
             await EnsureClient(year, form);
-            foreach (var other in Clients.Keys.Where(y => y != year))
+            if (query == null)
             {
-                try
-                {
+                foreach (var other in Clients.Keys.Where(y => y != year))
                     await EnsureClient(other, form);
-                }
-                catch (Exception) when (query != null)
-                {
-                }
             }
             var launcherPath = InstallSelf();
             RegisterProtocol(launcherPath);
@@ -166,9 +167,14 @@ namespace VexBloxLauncher
             }
 
             form.SetStatus("Starting VexBlox...", 100);
-            var client = LaunchClient(year, query);
             var keyFile = Path.Combine(ClientDirectory(year), PatchedKeyFile);
-            if (File.Exists(keyFile))
+            if (!File.Exists(keyFile))
+            {
+                (await StartClient(year, query, form)).Dispose();
+                return;
+            }
+
+            using (var client = LaunchClient(year, query))
             {
                 form.Hide();
                 var domain = new Uri(BaseUrl).Host;
@@ -178,16 +184,38 @@ namespace VexBloxLauncher
                     throw new Exception($"The domain {domain} must be 10 characters long to patch the {year} client.");
                 var key = File.ReadAllText(keyFile);
                 await Task.Run(() => MemoryPatcher.Run(client, domain, key, TimeSpan.FromSeconds(45)));
-                return;
             }
-            await Task.Delay(1500);
+        }
+
+        private static async Task<Process> StartClient(string year, Dictionary<string, string> query, ProgressForm form)
+        {
+            var client = LaunchClient(year, query);
+            if (year != "2015")
+                return client;
+
+            for (var attempt = 1; ; attempt++)
+            {
+                var exited = await Task.Run(() => client.WaitForExit(3500));
+                if (!exited || client.ExitCode == 0)
+                    return client;
+
+                var exitCode = client.ExitCode;
+                client.Dispose();
+                if (attempt == 2)
+                    throw new Exception($"The 2015 client closed during startup (0x{exitCode:X8}).");
+
+                form.SetStatus("Retrying the 2015 client...", 100);
+                await Task.Delay(750);
+                client = LaunchClient(year, query);
+            }
         }
 
         private static Dictionary<string, string> ParseJoinUri(string uri)
         {
-            var parsed = new Uri(uri);
-            if (!parsed.Host.Equals("join", StringComparison.OrdinalIgnoreCase))
-                throw new Exception("Unknown launch request: " + uri);
+            if (!Uri.TryCreate(uri, UriKind.Absolute, out var parsed)
+                || !parsed.Scheme.Equals(ProtocolName, StringComparison.OrdinalIgnoreCase)
+                || !parsed.Host.Equals("join", StringComparison.OrdinalIgnoreCase))
+                throw new Exception("Invalid VexBlox launch link. Open the game page and press Play again.");
 
             var values = HttpUtility.ParseQueryString(parsed.Query);
             var result = values.AllKeys.Where(k => k != null).ToDictionary(k => k, k => values[k], StringComparer.OrdinalIgnoreCase);
@@ -216,6 +244,13 @@ namespace VexBloxLauncher
             catch (Exception) when (installed != null)
             {
                 return;
+            }
+
+            if (!IsSha256(remote))
+            {
+                if (installed != null)
+                    return;
+                throw new Exception("The update server did not return a valid client checksum. Please try again later.");
             }
 
             if (installed == remote)
